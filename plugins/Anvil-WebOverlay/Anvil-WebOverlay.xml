@@ -1,0 +1,2133 @@
+<?xml version="1.0"?>
+<doc>
+    <assembly>
+        <name>Anvil-WebOverlay</name>
+    </assembly>
+    <members>
+        <member name="T:WebOverlay.Branding">
+            <summary>
+            The single place the published identity lives. The Forge requires the
+            plugin name to read "Username-ModName" and the GUID "com.username.modname",
+            so publishing under a different account only changes these constants.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.BoundsStore">
+             <summary>
+             Remembers where the player put each overlay window, so it reopens there
+             instead of resetting to the centered default. One text file next to the
+             shared browser data, one line per overlay: "x y w h key", the key last
+             because it may contain spaces.
+            
+             The file is shared by every mod and potentially several game processes,
+             so a save never trusts a stale snapshot: it re-reads the file under a
+             cross-process mutex, applies its one change and writes atomically. A
+             store that cannot be read is left alone - degrading to "not saved this
+             time" is recoverable, wiping other overlays' entries is not.
+             </summary>
+        </member>
+        <member name="M:WebOverlay.BoundsStore.sanitize(System.String)">
+            <summary>
+            Keys end up as the last field of a text line; a stray newline would
+            split the line and hijack a truncated key. Spaces are already legal.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.BoundsStore.readFile">
+            <summary>Missing file is an empty store; a failed read is null.</summary>
+        </member>
+        <member name="T:WebOverlay.ChannelProtocol">
+             <summary>
+             The framing behind named channels and request/reply.
+            
+             Every consumer of this library independently invented "prefix:payload"
+             and hand-wrote the page half of it, which is why this exists. What it
+             deliberately does not do is take over the plain string API: a message
+             that is not a well-formed envelope reaches
+             <see cref="E:WebOverlay.IWebOverlay.MessageReceived"/> exactly as it was sent, so
+             hand-written pages and older consumers keep working untouched.
+            
+             The envelope is JSON with a reserved marker, `__wo`, plus a kind
+             ("m" message, "q" request, "a" answer), the channel, the payload and -
+             for a request and its answer - an id. A page must not send JSON with a
+             top-level `__wo` of its own; that name is the reservation.
+             </summary>
+        </member>
+        <member name="F:WebOverlay.ChannelProtocol.ReservedPrefix">
+            <summary>
+            Channels under this prefix are the library talking to its own shim,
+            and never reach a consumer.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.ChannelProtocol.ShapeChannel">
+            <summary>The rectangles an overlay is cut down to; see the shim.</summary>
+        </member>
+        <member name="F:WebOverlay.ChannelProtocol.DiagChannel">
+            <summary>
+            Problems the page itself reports. Nothing inside a document reaches
+            the game log otherwise: a refused font, a script that threw, a
+            promise nobody caught - the page renders, looks wrong, and says so
+            only in a developer console nobody has open on a player's machine.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.ChannelProtocol.ShimFor(WebOverlay.OverlayTransparency,System.Boolean,System.Boolean)">
+            <summary>
+            The shim for one overlay: the constant below with its environment
+            filled in. What the page is told is what the overlay actually got,
+            decided before any of this is injected.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.ChannelProtocol.PageDiagnostics">
+            <summary>
+            Only injected while the consumer asked for it, so a page pays
+            nothing for this the rest of the time. It reports and never
+            swallows: the original console function is still called, and
+            onerror returns nothing, so a page's own handling is untouched.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.ChannelProtocol.ThemeTokens">
+            <summary>The library palette, applied only when a mod asks for it.</summary>
+        </member>
+        <member name="F:WebOverlay.ChannelProtocol.Shim">
+            <summary>
+            Runs before any page script, on every document, so `window.overlay`
+            is there by the time a page wants it. It only wraps the existing
+            message bridge - it grants a page nothing the bridge did not
+            already give it, and the source filter still decides who may talk.
+            Injected through <see cref="M:WebOverlay.ChannelProtocol.ShimFor(WebOverlay.OverlayTransparency,System.Boolean,System.Boolean)"/>, never raw.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.ChannelProtocol.TryParse(System.String,System.String@,System.String@,System.String@,System.Int32@)">
+            <summary>
+            Recognises an envelope, and nothing else. Anything the least bit
+            off - a nested object, a missing marker, a stray token - is not an
+            envelope, and the caller passes the message on untouched rather
+            than guessing. Only the fields this protocol defines exist, so a
+            full JSON reader would be more than is needed here and more to get
+            wrong.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.ConfigurationManagerAttributes">
+             <summary>
+             Duck-typed attribute bag read by reflection from BepInEx's
+             ConfigurationManager (the in-game F12 settings menu). No reference to
+             that assembly is needed: ConfigurationManager looks for fields with
+             these exact names on any object passed through the Tags of a
+             <see cref="T:BepInEx.Configuration.ConfigDescription"/>, and quietly
+             ignores the object when that menu is not installed.
+            
+             The names and shape match the copy consumers already carry, so a
+             setting can be given a friendly label or hidden behind Advanced while
+             the .cfg key and section stay as they are for existing config files.
+             </summary>
+        </member>
+        <member name="T:WebOverlay.GameCursorBridge">
+             <summary>
+             Asks the game to show the mouse cursor, through the game's own
+             mechanism, without this library knowing anything about the game at
+             compile time.
+            
+             Why not simply set <c>Cursor.visible</c>: the game's input manager
+             decides once per frame what the cursor state should be, and writes it
+             only when the live state disagrees. Setting the property is exactly
+             what creates that disagreement, so it re-hides the cursor, the mod
+             shows it again, and the pair alternate at frame rate - the flicker
+             every overlay mod runs into. The game's own write also swaps the cursor
+             bitmap for a fully transparent one, which a mod forcing only the
+             property never restores.
+            
+             The way out is to make the game *want* the cursor visible. It has a
+             flag for exactly that, OR-ed into its per-frame decision and set by a
+             global event, and it uses that flag itself where its own world needs a
+             cursor mid-raid. Then there is no disagreement, nothing alternates,
+             and the one write the game does perform restores visibility, lock mode
+             and bitmap together.
+            
+             All of it by reflection: this assembly references BepInEx and Unity and
+             nothing else, and a game that renames these types must leave the
+             library working - it falls back to setting the properties, which is
+             what it did before and is still better than nothing.
+             </summary>
+        </member>
+        <member name="P:WebOverlay.GameCursorBridge.Available">
+            <summary>
+            Whether the game exposes what this needs. False means a caller
+            should fall back to setting the cursor properties itself.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.GameCursorBridge.Show(System.Boolean)">
+            <summary>
+            Tells the game to keep the cursor shown, or to stop. Only worth
+            calling when the answer changes - it is a state, not a nudge.
+            Returns false if the request could not be made, so the caller can
+            fall back for this frame.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.Interop.ComCallback">
+             <summary>
+             A COM object built by hand: a block of memory whose first field points at
+             a vtable of four function pointers (IUnknown plus one Invoke).
+            
+             This exists because the official WebView2 wrapper cannot be used under
+             Unity's Mono. The SDK's interfaces express inherited vtable slots with
+             `_VtblGap` markers, which Mono ignores, so calls land on the wrong
+             function - measured: it kills the process with no managed exception.
+             Function pointers taken from delegates, on the other hand, Mono handles
+             reliably.
+             </summary>
+        </member>
+        <member name="F:WebOverlay.Interop.ComCallback.Pointer">
+            <summary>
+            The COM object handed to native code. Zero once freed - which only
+            happens after both sides let go.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.Interop.ComCallback.#ctor(System.Guid,System.Func{System.Int32,System.IntPtr,System.Int32})">
+            <summary>Completion handler shape: Invoke(HRESULT, result).</summary>
+        </member>
+        <member name="M:WebOverlay.Interop.ComCallback.#ctor(System.Guid,System.Func{System.IntPtr,System.IntPtr,System.Int32})">
+            <summary>Event handler shape: Invoke(sender, args).</summary>
+        </member>
+        <member name="M:WebOverlay.Interop.ComCallback.Dispose">
+            <summary>
+            Releases the managed owner's reference. The memory is freed only
+            when the native side holds no reference either - a completion that
+            never arrived, or an event source that was not closed, still owns
+            the pointer, and freeing memory native code can call is a process
+            crash. Such an instance stays rooted here until native releases it,
+            which frees it then; one that is never released stays for the
+            process lifetime, which is the safe end of the trade. Idempotent.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.Interop.DCompApi">
+             <summary>
+             The sliver of DirectComposition the composed overlay needs: a device
+             (no D3D required - WebView2 brings the content), a target bound to the
+             window, and one visual the browser draws into.
+            
+             Slots verified against the Windows SDK dcomp.h by two independent
+             readers, and proven by the composition probe (device creation, visual
+             tree, per-pixel alpha, synthetic input all observed working). dcomp.h
+             is C++-only and MSVC reverses consecutive overload PAIRS in the binary
+             vtable (SetOffsetX/Y, SetTransform, SetClip) - none of the members
+             used here are overloaded, so the counted slots hold.
+             </summary>
+        </member>
+        <member name="M:WebOverlay.Interop.DCompApi.DCompositionCreateDevice2(System.IntPtr,System.Guid,System.IntPtr@)">
+            <summary>
+            renderingDevice may be null: such a device can commit a visual tree
+            (all this library needs) but not create GPU surfaces of its own.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.Interop.WebView2Api">
+             <summary>
+             Vtable slot numbers and signatures for the parts of WebView2 this library
+             uses, taken from the official WebView2.h.
+            
+             The `_VtblGap` rule: the SDK's managed wrapper expresses inherited vtable
+             slots with `_VtblGap` markers that Mono ignores, so that wrapper must
+             never be used - calls would dispatch to the wrong function. Members of
+             versioned interfaces (Controller2 and later) are reachable, but only via
+             an explicit QueryInterface for that interface's IID plus an absolute slot
+             counted through every inherited member in WebView2.h - and each such slot
+             must be proven by an observable effect before it is trusted (see the
+             slot comments below for how existing ones were proven).
+             </summary>
+        </member>
+        <member name="M:WebOverlay.Interop.WebView2Api.Method``1(System.IntPtr,System.Int32)">
+            <summary>Binds a vtable slot of a COM object to a callable delegate.</summary>
+        </member>
+        <member name="T:WebOverlay.Interop.WebView2Api.PutColorDelegate">
+            <summary>
+            COREWEBVIEW2_COLOR is four bytes {A,R,G,B} passed by value, which on
+            x64 travels as the little-endian integer A | R&lt;&lt;8 | G&lt;&lt;16 | B&lt;&lt;24.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.Interop.WebView2Api.SendMouseInputDelegate">
+            <summary>
+            POINT by value is one 8-byte register on x64: packed as a long with
+            x in the low and y in the high half. Proven by the probe's clicks.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.OverlayHost">
+             <summary>
+             Owns the one thread everything WebView2 runs on, and the one browser
+             environment shared by every overlay in the process.
+            
+             Both are deliberately singular. WebView2 is COM and needs a thread that
+             is STA and pumps messages, which the game's main thread is not and does
+             not; and every additional environment starts its own browser process
+             tree and wants exclusive use of its user-data folder, so one per mod
+             would cost memory and collide.
+             </summary>
+        </member>
+        <member name="T:WebOverlay.OverlayHost.WorkItem">
+            <summary>
+            One queued command. The owner is the window a droppable command
+            was posted for, so its share of the queue can be given back when
+            the command runs; an obligation - a Dispose, a page answer - has
+            none, because it is never counted against a share.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayHost.SpareAttemptLimit">
+            <summary>
+            How often a second browser is asked for before the library stops
+            trying. Enough to ride out a transient failure, few enough that a
+            machine where it cannot work does not pay the wait every time.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayHost.Diagnose">
+            <summary>
+            Turns on the window-lifecycle reporting used to answer "the panel is
+            up but the library thinks it is hidden". Set from the plugin's
+            Diagnostics switch; costs nothing while off.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayHost.SimulateShimRejection">
+            <summary>
+            Test seam: makes the next channel-shim completion report failure.
+            A real browser never rejects the library's own shim on demand, and
+            the failure path that tells a consumer its channels are dead must
+            not be the one path in this library nothing can prove. Set only by
+            the probe, via reflection; nothing in production writes it.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayHost.DiagnosePage">
+            <summary>
+            Whether pages should report their own problems. Read once per
+            OVERLAY, when its shim is registered - the browser replays that one
+            script for every document afterwards, so an overlay that already
+            exists keeps whatever it was created with, reload or not.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.LogPageDiagnostic(System.String,System.String)">
+            <summary>
+            One line for something the page said went wrong. Rate-limited on
+            purpose: a page can throw once per frame, and an instrument that
+            floods the log is not one anybody reads.
+            </summary>
+            <remarks>
+            The notice that reports are being held back is written the moment
+            the limit is passed, not when the next one happens to arrive after
+            the window expires - a burst that stops would otherwise leave its
+            own count unreported forever, and the count would be attributed to
+            whichever window spoke next. The budget is shared by every overlay,
+            which is deliberate: what is being protected is one log.
+            </remarks>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.ResetPageDiagnostics">
+            <summary>Forgets the rate-limit budget, so a fresh session starts quiet.</summary>
+        </member>
+        <member name="P:WebOverlay.OverlayHost.StartFailure">
+            <summary>
+            Why the shared start failed, so an overlay created afterwards can
+            tell its consumer something more useful than "no environment".
+            </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayHost.StartFailureMessage">
+            <summary>
+            The sentence behind <see cref="P:WebOverlay.OverlayHost.StartFailure"/>. An overlay failing
+            for want of the shared environment reports this rather than its own
+            "no environment", which names the symptom instead of the cause.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.startFailure(WebOverlay.OverlayFailure,System.String)">
+            <summary>
+            Records the first cause and keeps it: what follows a failed start
+            are its consequences - a timeout after a browser that already said
+            no - and the consumer needs the cause, not the last symptom.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.EnsureStarted">
+            <summary>
+            Starts the thread and the browser environment on first use, without
+            waiting for either: Unity's thread must never block on a browser
+            start that can take many seconds. Work posted meanwhile is queued
+            and runs once the environment attempt has finished; whether it
+            succeeded surfaces through each overlay's Failed event.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayHost.WorkQueueLimit">
+            <summary>
+            The overlay thread's command queue is bounded in two tiers. The
+            ceiling is the process's memory bound, like MainThreadQueueLimit -
+            at the measured ~9,600 messages per second it is close to half a
+            second of maximum-rate traffic already waiting. Below it, each
+            window has a share (<see cref="F:WebOverlay.OverlayHost.WindowShare"/>), and that is what
+            makes a mod posting in a hot loop cost itself rather than every
+            mod in the process: the queue is one queue, shared by every overlay
+            of every mod, so before 1.11.0 the first mod to fill it had every
+            other mod's next Show, Hide or Post refused. Now the flooder is
+            refused at its share while everyone else still enters; what they
+            cannot be spared is the wait behind the flooder's backlog, since it
+            is one queue drained by one thread - about a tenth of a second at
+            the measured rate. The share is generous by the same measure that
+            bounds the outbox: no healthy consumer has a hundred commands
+            waiting, let alone a thousand.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayHost.OverflowWarnIntervalMilliseconds">
+            <summary>
+            How often an overflow warning may repeat while the condition
+            lasts: once, then at most once a minute. A burst poster that fills
+            and drains its share five times a second must not write five lines
+            a second, and a mod that floods again an hour later must be named
+            again - one stamp serves both.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.ShouldWarnAgain(System.Int32@)">
+            <summary>
+            Rate-limits one warning through a tick stamp: zero means never
+            warned, and the stored value is kept odd so a genuine tick count
+            can never read as zero. Safe from any thread - the caller that
+            wins the exchange is the one that logs.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayHost.CreationBacklogThreshold">
+            <summary>
+            Creations are not bounded, deliberately: refusing one would need a
+            failure path into a window that does not exist yet, and each entry
+            is one consumer-held handle, so the consumer's own memory grows at
+            least as fast as this queue. Past the threshold it is named in the
+            log instead - a mod creating overlays in a loop is a bug report
+            waiting to be written, and the line writes most of it.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.TryPost(WebOverlay.OverlayWindow,System.Action)">
+            <summary>
+            Fire-and-forget work for one window: dropped, with a warning, when
+            that window's share or the queue's ceiling is full. Returns true
+            while the game is shutting down although nothing is queued then -
+            every path here accepts and swallows on the way out, and that
+            uniform answer is what keeps a refused Request or ExecuteScript
+            from waking a consumer's fallback during teardown. For work that
+            carries an obligation - an answer somebody is waiting for, a
+            Dispose that releases native state - use <see cref="M:WebOverlay.OverlayHost.Post(System.Action)"/>, which
+            never drops and is never counted against a share.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.wake">
+            <summary>
+            Before the first environment attempt finishes the pump already runs
+            (it must, for the completion callback), so the dispatcher must not
+            drain overlay work yet - the queues hold it until then.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.EnvironmentFor(System.Boolean)">
+             <summary>
+             Which browser an overlay of this kind has to be built from.
+            
+             A browser hosting a transparent overlay refuses to create a
+             windowed one: the second creation fails with ERROR_INVALID_STATE,
+             which in practice is one mod's HUD breaking another mod's panel.
+             Two environments sharing a user data folder share the browser
+             process, so the way out is a second browser with a folder of its
+             own - and that costs real memory (measured: about six processes and
+             a quarter of a gigabyte). So it is created only when the collision
+             actually happens, and it takes the windowed overlay: a game whose
+             mods only use HUDs, only use windows, or open the window first
+             never pays for it.
+             </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.ComposedControllerOpened">
+            <summary>
+            Counted so the decision above can be made: a live transparent
+            overlay is what makes the main browser refuse windowed ones.
+            Both are called on the overlay thread.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.WindowedControllerOpened(System.Boolean)">
+            <summary>Windowed views in the main browser, for the same decision.</summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.createSpareEnvironment">
+            <summary>
+            Runs on the overlay thread, inside the work item that is creating
+            the overlay that needs it.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayHost.SpareSuffix">
+            <summary>
+            A folder of its own is the whole point: environments that share one
+            share the browser process, and the browser is what refuses to host
+            both kinds.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayHost.Environment">
+            <summary>The windowed environment; whether the library started.</summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.DispatchToMainThread(System.Action)">
+            <summary>
+            Offers one event for delivery on the game's main thread. Returns
+            false when nobody is pumping, which is the caller's cue to invoke it
+            itself - queuing into a queue nobody drains would simply lose the
+            event.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.DispatchToMainThread(System.Action,System.Boolean)">
+            <summary>
+            Hands work to the game's main thread. Events may be dropped when the
+            queue is full - that is what the limit is for - but an answer
+            somebody is waiting for may not: the count of outstanding answers is
+            bounded by the calls that asked for them, so letting those past the
+            limit cannot run away. Dropping one instead would break the
+            "answered exactly once" contract, and delivering it inline would run
+            a handler that expects the main thread on the overlay thread, which
+            for a handler touching Unity objects is worse than either.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayHost.MainThreadPumpAvailable">
+            <summary>
+            Whether main-thread delivery is possible; set by whoever pumps.
+            Turning it off leaves queued events undelivered on purpose - that
+            only happens as the game shuts down.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayHost.DisplayModeProbe">
+            <summary>
+            Whether a window over the game can be shown at all. The plugin
+            registers this, because only Unity knows the display mode and this
+            half of the library stays free of it; without a probe every mode is
+            assumed fine, which is what a non-Unity host wants.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.ForegroundWindow">
+            <summary>
+            Which window the OS says is in front, for a caller that wants to
+            report it. Zero when nothing is.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.DescribeOverlayWindows">
+            <summary>
+            Every live overlay window with the handle it actually has, so a
+            report can say which one the foreground failed to match.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.ForegroundIsOverlay(System.IntPtr)">
+            <summary>
+            Whether the foreground window belongs to an overlay of ours. A
+            handle comparison and nothing else: this answers "which window is
+            in front", so what that window asked for must not enter into it.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayHost.CursorCapturedProbe">
+            <summary>
+            Whether the game currently holds the mouse - locked to a point and
+            hidden, the way it is while the player is looking around. Only Unity
+            knows, and the rest of this library deliberately does not know
+            Unity, so the plugin registers it; the same bridge the fullscreen
+            guard uses. Null means "assume it does", which is the safe end: the
+            overlay then behaves as it did before this was asked.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayHost.CapturedAgreement">
+            <summary>
+            How many frames in a row the answer has to disagree with what is
+            believed before the belief changes. Two mods writing the cursor in
+            the same frame - one showing it, the game hiding it again - make
+            the raw answer alternate at frame rate, and acting on that would
+            rewrite the window style twice a frame forever. Neither reading is
+            wrong; the state is simply contested, and the honest response to a
+            contested state is to keep the last settled one.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.UpdateClickThrough">
+            <summary>
+            Lets the mouse through overlays that asked for it while the game is
+            in front. Called once per frame; each window only acts on a change.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.WantsFreeCursor">
+            <summary>
+            Whether any visible overlay asked for the cursor to be freed while
+            the game is unfocused. Asked once per frame by the plugin, which
+            owns the Unity side of that.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.PumpMainThread">
+            <summary>Delivers queued events. Call this from the main thread only.</summary>
+        </member>
+        <member name="P:WebOverlay.OverlayHost.Stopping">
+            <summary>The game is quitting; failures are expected, not news.</summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.createEnvironments">
+            <summary>
+            The browser every overlay is built from to begin with - transparent
+            ones always. Only a windowed overlay that runs into a browser busy
+            hosting transparent ones gets a second browser, and only then; see
+            <see cref="M:WebOverlay.OverlayHost.EnvironmentFor(System.Boolean)"/>.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.prepareFolder(System.String)">
+            <summary>
+            A browser told to use a folder it cannot create shows the player a
+            modal error box of its own, so the folder is made here first and a
+            failure stays a log line.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHost.report(System.Boolean,WebOverlay.OverlayFailure,System.String)">
+            <summary>
+            A required environment failing is why the library cannot work; an
+            optional one failing is worth knowing but not a start failure.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.OverlayWindow">
+            <summary>
+            One overlay: a window over the game plus the browser view inside it.
+            Everything here runs on the overlay thread; the public handle marshals
+            calls onto it.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.OverlayWindow.Pending">
+            <summary>
+            A send waiting for the page. A script may carry the consumer's
+            result callback, which has to be answered either way: dropping it
+            silently would leave a caller waiting for a value that can never
+            arrive.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayWindow.Pending.LatestChannel">
+            <summary>Set for a channel message that may be superseded.</summary>
+        </member>
+        <member name="F:WebOverlay.OverlayWindow.Pending.RequestId">
+            <summary>
+            The question this envelope asks, when it is one. A request that
+            has already timed out - answered null - must not still be put
+            to the page later, or a handler with side effects runs for an
+            answer nobody is listening for any more.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayWindow.Pending.Generation">
+            <summary>
+            The document this envelope belongs to, for the two kinds that
+            belong to one: a question put to a page, and an answer owed to
+            it. Zero for an ordinary send, which belongs to whatever page
+            the mod is targeting rather than to a particular document.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayWindow.activeNavigationId">
+            <summary>
+            The WebView2 NavigationId of the top-level navigation this overlay
+            last adopted - the one whose completion is the only one worth
+            believing. Two rapid navigations interleave as Starting(new) then
+            Completed(old): the browser completes a superseded navigation as
+            cancelled AFTER the replacement has started, and matching by
+            position alone then reports the old failure against the new page,
+            or worse, takes a stale success as the new page being ready.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayWindow.haveActiveNavigation">
+            <summary>
+            An explicit flag rather than an id==0 sentinel: nothing promises
+            ids are nonzero. False also means "fall open" - a runtime whose
+            args refuse the id keeps today's positional behaviour rather than
+            stranding IsPageLoaded forever.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.OverlayWindow.ScriptCall">
+            <summary>
+            One script in flight. The consumer callback lives here rather than
+            only inside the completion closure, because a close has to be able
+            to answer it: once the controller is gone the completion may never
+            arrive. Settling is once-only, so a completion that does arrive
+            afterwards finds the call already answered.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.OverlayWindow.VisibilityCall">
+            <summary>
+            One Show or Hide whose caller asked how it ended. Only ever held
+            while the browser view is still being built - every other request
+            is answered where it runs - and only one at a time: a newer
+            request settles the parked one as superseded. Settling is
+            once-only, so the creation tail, a failure and a close cannot
+            answer the same request twice between them.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayWindow.ChannelsOk">
+            <summary>
+            How the channel shim settled: null while unknown, then true or
+            false, once, forever. The handle's latched event and property are
+            driven from these; both fire on the overlay thread like every
+            other event here.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayWindow.persistenceKey">
+            <summary>
+            Bounds are remembered per key. The default is namespaced with the
+            calling mod's assembly, so two mods titling their window the same
+            do not trade positions; an explicit PersistenceKey wins verbatim.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayWindow.RequestReceived">
+            <summary>
+            The page asked the mod something: channel, payload, and the reply
+            to call exactly once. Left null, every request is answered with
+            nothing rather than left open.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.setVisible(System.Boolean,System.Boolean)">
+            <summary>
+            Raises VisibilityChanged only for real transitions, so a consumer
+            can trust it as state rather than having to compare against its own
+            flag - which is what Closed, firing on every Hide, forces today.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayWindow.pageLoaded">
+            <summary>
+            Read from the consumer's thread, written here - both are single
+            writes of a word, and the volatile keeps the reader from seeing a
+            stale one.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayWindow.Transparency">
+            <summary>
+            Which transparency this overlay ended up with - decided before the
+            window exists, so it is already true when the page is injected.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.Describe">
+            <summary>Handle, title and the two conditions, for a diagnostic report.</summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.UpdateClickThrough(System.IntPtr,System.Boolean)">
+            <summary>
+            Lets the mouse through to the game while the game is in front, for
+            an overlay that asked for it. Called once per frame with the OS
+            foreground; does nothing until the answer changes.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.Is(System.IntPtr)">
+            <summary>Whether this is the window the handle names.</summary>
+            <remarks>
+            Ownership only, with no opinion about what the window asked for.
+            The diagnostic used to ask <see cref="M:WebOverlay.OverlayWindow.WantsFreeCursor(System.IntPtr)"/> instead,
+            which also requires FreeCursorWhileShown - so a panel that had only
+            asked for click-through was reported as some other application's
+            window, in the one line written to identify it.
+            </remarks>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.WantsFreeCursor(System.IntPtr)">
+            <summary>
+            Whether this overlay wants the cursor handed back right now. Read
+            once per frame by the plugin: the question is whether this overlay
+            is the window in front - not whether Unity thinks it lost focus,
+            which is a different thing and, in a game that keeps the cursor,
+            not the one that decides.
+            </summary>
+            <remarks>
+            Being the foreground window is the whole test: Windows does not
+            give the foreground to a hidden window, so "is it shown" adds
+            nothing - except a race it used to lose. Show() makes the window
+            visible and takes the foreground BEFORE it records that the overlay
+            is shown, so for the moment in between this said "not mine" about a
+            window sitting in front of the player. Asked once per frame, that
+            moment is easy to hit, and the cursor then stayed captured for as
+            long as the panel was up.
+            </remarks>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.settleVisibility(WebOverlay.OverlayWindow.VisibilityCall,WebOverlay.VisibilityOutcome)">
+            <summary>
+            Answers a visibility request, exactly once - or, once the game is
+            shutting down, not at all: the answer path would wake the consumer
+            on the way out, which nothing here may do.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.supersedeParkedShow">
+            <summary>
+            A newer visibility request replaces whatever was still waiting for
+            the browser view - with or without a completion of its own.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.fail(WebOverlay.OverlayFailure,System.String)">
+            <summary>
+            Marks the overlay broken and tells the consumer, exactly once. The
+            window is hidden rather than destroyed - the consumer still owns the
+            handle and disposes it. The kind is what the consumer can act on;
+            the reason is the exact sentence, logged and readable from the
+            handle.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayWindow.stillWanted">
+            <summary>
+            Whether building this overlay is still worth finishing. Read it
+            again after anything that pumps messages: the consumer may have
+            disposed the handle, or the host may have started shutting down,
+            while this method was suspended inside such a wait.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.injectChannelShim">
+             <summary>
+             Puts `window.overlay` into every document before its own scripts
+             run, which is the half of named channels a consumer cannot write
+             for itself. It only wraps the existing message bridge, so it hands
+             a page nothing it did not already have.
+            
+             Installation is asynchronous, and the browser only promises the script is installed
+             once the completion has run - so the first navigation waits for it
+             rather than racing it. Without that, the mod's own first page could
+             come up without the object its very first script uses.
+            
+             Only the navigation waits. `Ready` and the window itself do not:
+             `Ready` has never meant "the page is loaded" - that is
+             <see cref="F:WebOverlay.OverlayWindow.PageLoaded"/> - so nothing a consumer can observe moves.
+             </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.applyVirtualHosts">
+             <summary>
+             Serves the mod's own folders as `https://&lt;host&gt;/`, which is the
+             only way a page gets real files - and, when it navigates there
+             instead of being handed inline markup, a real origin with working
+             storage. Read-only, and the mapping lives only in this overlay's
+             view, so nothing outside it reaches the folder; inside it, CORS-
+             checked access from another origin is denied while ordinary
+             sub-resource loads are not.
+            
+             A bad mapping is a broken page, not a broken security boundary, so
+             it is logged and skipped rather than failing the overlay - the
+             consumer sees its own missing content.
+             </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.isUsableHostName(System.String)">
+            <summary>
+            A host name only - no scheme, path, port or credentials. Anything
+            else would silently map nothing, or map something other than what
+            the caller wrote.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.accessKind(WebOverlay.HostAccess)">
+            <summary>
+            The library's enum is deliberately its own type rather than the raw
+            numbers: WebView2 orders them DENY, ALLOW, DENY_CORS, and the value
+            a consumer gets by leaving the property alone has to be today's
+            behaviour, not whatever happens to be zero over there.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.refuseAfterFailure(System.Action{System.String})">
+            <summary>
+            Nothing can reach a page that no longer exists. Without this a send
+            after the failure would go into the outbox, and a script caller
+            would wait there until the buffer overflowed or the handle was
+            disposed - long after the answer was knowable.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.startPendingNavigation">
+            <summary>
+            Returns false when the browser refused the page outright, which is
+            terminal on this path: nothing here has an earlier target to fall
+            back to, and no further attempt is coming.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.forgetTarget">
+            <summary>
+            Back to "no page named". Only for a navigation the browser refused
+            on this internal path, which has no earlier target to fall back to:
+            a mod that asked for a page before the browser existed, or a reload
+            after a renderer crash. Leaving the refused page as the target
+            would point the overlay at something that can never load - every
+            send would buffer into nothing, IsPageLoaded would stay false for
+            good, and the mod's next LoadHtml would look like a retarget away
+            from it and throw out state that never belonged to any page.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.subscribeToNavigation">
+            <summary>
+            The security boundary of the overlay: navigation is refused unless
+            the target origin was put on the list by the mod itself, popups are
+            suppressed, permission prompts (camera, location, ...) are denied,
+            and a dead browser process is reported instead of silently showing
+            a corpse. Returns false when any of these did not register - an
+            overlay without its boundary must not go live.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.blockDownloads">
+            <summary>
+            A page over a game has no business writing files to the player's
+            disk, and a download bar over the game is never wanted - so unless
+            the mod said <see cref="P:WebOverlay.OverlayOptions.AllowDownloads"/>, every
+            download is cancelled and its UI suppressed, with one warning
+            naming the URL. Deliberately NOT folded into the armed check: a
+            runtime from before 2021 has no download control at all, and an
+            overlay on such a runtime should keep working as it always has -
+            with browser-managed downloads and a log line saying so - rather
+            than fail.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.currentDocumentIsTarget">
+            <summary>
+            Whether the top-level document currently shown is the one the mod
+            last targeted: for LoadHtml the inline page (about:blank or its
+            data: form), for Navigate a document on the same origin as the URL.
+            The check runs against the live source, so buffered and direct
+            sends both stay bound to the mod's own target.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.isNavigationAllowed(System.String,System.Boolean)">
+            <summary>
+            NavigateToString is implemented by the browser as a navigation to a
+            data: URI (measured in game: the filter blocked it and LoadHtml
+            pages stayed white). That exact navigation is allowed once per
+            LoadHtml via a one-shot bound to the top level - a frame must
+            neither consume nor use it. Runtimes that report the inline page as
+            about:blank disarm the one-shot there instead.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.isMessageAllowed(System.String)">
+            <summary>
+            Messages from the mod's own inline page report about:blank or its
+            data: URI as their source, depending on the runtime. Both are only
+            reachable through LoadHtml (navigation there is blocked otherwise),
+            so while inline HTML is loaded they are the mod's own content.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.originOf(System.String)">
+            <summary>
+            Only http/https with a real host produce an origin. Everything else
+            (data:, javascript:, file:, about:) returns null and is therefore
+            never allowed - authority-less schemes would otherwise all collapse
+            onto the same empty string and trust each other.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.checkNavigationResult(System.Int32,System.String)">
+            <summary>
+            A synchronously rejected navigation (invalid URL, inline HTML over
+            the 2 MB limit) never produces NavigationCompleted. Nothing
+            happened, so nothing here changes: the buffered sends and the
+            retained state stay with whatever page is - or becomes - the
+            target. Dropping them used to look tidy, but the page they were
+            meant for is either still on screen or still to be named, and a mod
+            left believing its configuration is up while the page runs on its
+            defaults is exactly the silent loss Retain exists to prevent.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.OverlayWindow.TargetState">
+            <summary>
+            What the mod currently points the overlay at. A rejected navigation
+            leaves the old document on screen, so the bookkeeping has to go back
+            with it - otherwise the overlay would consider a page that never
+            loaded its target, and report "not loaded" for the rest of its life
+            while buffering every send into nothing.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayWindow.targetBeforeNavigation">
+            <summary>
+            What the overlay was pointed at before the navigation now in
+            flight. The origin filter can refuse that navigation AFTER the
+            browser accepted the request, and then the page already on screen
+            stays there - so its state has to come back, exactly as it does
+            when the browser refuses the request outright. Null when nothing is
+            in flight, or when the refused navigation was the first one and
+            there is nothing to come back to.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.LoadHtml(System.String)">
+            <summary>Shows markup directly, so a mod needs no web server at all.</summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.routeChannelMessage(System.String)">
+            <summary>
+            Takes anything that is a channel envelope; everything else is left
+            alone, so a page that never heard of channels keeps talking to
+            <see cref="F:WebOverlay.OverlayWindow.MessageReceived"/> exactly as before.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.SetShape(WebOverlay.Interop.WebView2Api.RECT[])">
+             <summary>
+             Cuts the overlay down to a set of rectangles: it draws there and
+             takes the mouse there, and everything outside belongs to the game.
+             Null restores the whole window.
+            
+             Both halves come from one mechanism on purpose, because Windows
+             offers no other. Answering the hit test with "not me" keeps the
+             picture but only passes clicks to windows of the same thread, which
+             the game never is - measured, the click reached nothing at all. A
+             window region does route clicks to whatever is behind, across
+             processes, but clips the picture to the same shape. So a caller
+             gets exactly one contract, and it is this one.
+             </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.applyShapeFromPage(System.String)">
+            <summary>
+            A shape the page sent. A list that cannot be read is ignored
+            outright: dropping it is not the same as clearing the shape, and
+            clearing it would hand a full-screen interactive HUD back the whole
+            mouse - the very thing the caller used a shape to avoid.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.tryParseRegions(System.String,WebOverlay.Interop.WebView2Api.RECT[]@)">
+            <summary>
+            "x,y,w,h;x,y,w,h" in device pixels, which is what the page shim
+            sends after scaling its CSS rectangles. Deliberately not JSON: this
+            is the library talking to its own shim. An empty payload is an
+            explicit "no shape"; anything unreadable is a failure, and the two
+            must not be confused.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.SetBounds(System.Nullable{System.Int32},System.Nullable{System.Int32},System.Nullable{System.Int32},System.Nullable{System.Int32})">
+            <summary>
+            Moves or resizes the overlay at runtime, in screen coordinates. Not
+            remembered: the bounds store is for the spot the player chose, and a
+            mod resizing its own window must not overwrite that. It does win
+            over a remembered spot for the rest of the session, though - the mod
+            asked last.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.PostToChannel(System.String,System.String,WebOverlay.PostOptions)">
+            <summary>Sends a message to the page on a named channel.</summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.forgetPageState">
+            <summary>
+            Everything that was meant for the page being left behind.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.replayRetained">
+            <summary>
+            Hands a fresh document the state the mod has been assuming. Before
+            the outbox, so a message the mod sent while the page was loading
+            wins over the older retained value on the same channel.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.RequestFromPage(System.String,System.String,System.Action{System.String},System.Int32)">
+            <summary>
+            Asks the page a question. The callback is answered exactly once:
+            with the page's reply, or with null once the deadline passes - a
+            page that cannot answer must not be able to hang the mod.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.answer(System.Action{System.String},System.String)">
+            <summary>
+            Hands a script result - or the absence of one - to the consumer.
+            Every path that gives up on a script has to come through here.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.clearOutbox">
+            <summary>
+            Drops everything buffered, telling any waiting script caller that
+            no result is coming.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.Show(System.Action{WebOverlay.VisibilityOutcome})">
+            <summary>
+            Shows the window, and - when the caller asked - says how that
+            ended. Precedence at every answer: a closed window, then a failed
+            one, then the display mode, then whether anything changed. The
+            answer settles exactly once, or not at all once the game is
+            shutting down, and it never waits on anything but the browser
+            view being built.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.Hide(System.Action{WebOverlay.VisibilityOutcome})">
+            <summary>
+            Hides the window; see <see cref="M:WebOverlay.OverlayWindow.Show(System.Action{WebOverlay.VisibilityOutcome})"/> for how a request is
+            answered. A window whose browser view does not exist yet cannot be
+            showing - Show defers on the same condition - so the request is
+            already met and answered at once, with nothing parked.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.followGameWindow">
+            <summary>
+            A HUD is glued to the game picture, but the game window can move,
+            change monitor or resolution. A cheap half-second check keeps the
+            canvas aligned without hooking the game's message loop.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.forwardMouse(System.UInt32,System.IntPtr,System.IntPtr)">
+            <summary>
+            Translates a real mouse message into the browser's input call. The
+            event kinds mirror the WM codes and the virtual-key flags mirror
+            the MK_* flags in wParam, so the translation is nearly verbatim;
+            only the wheel needs work (screen coordinates, delta in the high
+            word) plus capture and leave bookkeeping.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.notifyPositionChanged">
+            <summary>
+            WebView2 places dialogs, tooltips and accessibility popups relative
+            to remembered screen coordinates; it asks to be told when they move.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.applyDarkFrame">
+            <summary>
+            A stock Windows title bar over a game breaks the picture, so the
+            frame is recolored to a dark game-appropriate grey. Windows 11 takes
+            the exact colors; Windows 10 only knows its dark mode; anything
+            older keeps the stock frame. All of it is cosmetic, so every call
+            may fail freely.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.tryPrepareComposition">
+            <summary>
+            A composition HUD needs a DComp device (no D3D device required) and
+            an environment that can create composition controllers. Both checks
+            are synchronous and cheap, so the mode is known before any window
+            exists. The device is kept for the wiring later.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.createComposedView">
+            <summary>
+            The composed path: the browser draws into a DirectComposition
+            visual instead of child windows, which is what makes true
+            per-pixel alpha and input forwarding possible. The controller that
+            comes back also answers for ICoreWebView2Controller, so the whole
+            existing configuration path applies unchanged.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.subscribeToCursor">
+            <summary>
+            In visual hosting the browser cannot set the mouse cursor itself;
+            it announces what it wants and the window applies it on WM_SETCURSOR.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayWindow.applyTransparentBackground">
+            <summary>
+            Asks the browser to render nothing where the page paints nothing.
+            Those pixels then show this window's key-color background, which the
+            chroma key in turn replaces with the game. Needs the Controller2
+            interface, present in every WebView2 runtime from 2021 on.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayWindow.TransparencyKey">
+            <summary>
+            COLORREF (0x00BBGGRR) of rgb(3,1,3): dark enough that antialiased
+            edges blending towards it stay invisible, and unlikely enough that no
+            page paints it on purpose.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayWindow.hudBrush">
+            <summary>One brush per process; the HUD window class owns it forever.</summary>
+        </member>
+        <member name="T:WebOverlay.WebOverlays">
+             <summary>
+             Shows web pages in windows over Escape From Tushonka, so a mod can build a
+             user interface in HTML instead of an immediate-mode toolkit.
+            
+             Everything is safe to call from Unity's thread and nothing blocks it:
+             the browser starts asynchronously on its own thread. Nothing here
+             throws: when overlays are already known to be unusable,
+             <see cref="M:WebOverlay.WebOverlays.Create(System.String,WebOverlay.OverlayOptions)"/> returns null; failures that surface later (no
+             WebView2 runtime, the browser will not start) raise the handle's
+             <see cref="E:WebOverlay.IWebOverlay.Failed"/> event - dispose the handle there and
+             fall back.
+             </summary>
+        </member>
+        <member name="P:WebOverlay.WebOverlays.IsAvailable">
+            <summary>
+            Kicks off the browser start and reports whether overlays are still
+            plausible. False only when a previous start already failed; a true
+            does not yet guarantee success - that is what
+            <see cref="E:WebOverlay.IWebOverlay.Failed"/> is for.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.WebOverlays.RuntimeVersion">
+            <summary>The installed WebView2 runtime, once known.</summary>
+        </member>
+        <member name="M:WebOverlay.WebOverlays.Create(System.String,WebOverlay.OverlayOptions)">
+            <summary>
+            Creates an overlay. Returns null when overlays are unavailable, in
+            which case the caller should use its own fallback.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.OverlayFailure">
+            <summary>
+            Why an overlay reported <see cref="E:WebOverlay.IWebOverlay.Failed"/>. The cases are
+            grouped by what the consumer can tell its user to do about them, not by
+            where in the library the error happened; the exact sentence is in
+            <see cref="P:WebOverlay.IWebOverlay.FailureMessage"/> and the log.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayFailure.Unknown">
+            <summary>No failure, or a cause the library could not classify.</summary>
+        </member>
+        <member name="F:WebOverlay.OverlayFailure.LibraryIncomplete">
+            <summary>
+            `WebView2Loader.dll` is missing next to the library - the
+            installation is incomplete, so reinstalling it is the fix.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayFailure.RuntimeMissing">
+            <summary>
+            No WebView2 runtime on this machine. The user has to install it;
+            current Windows 10/11 installations already have it.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayFailure.EnvironmentFailed">
+            <summary>
+            The runtime is there but the shared browser environment did not
+            start (or timed out). Usually transient or a broken user-data
+            folder; overlays stay unavailable for this game session.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayFailure.WindowFailed">
+            <summary>The overlay's own window could not be created.</summary>
+        </member>
+        <member name="F:WebOverlay.OverlayFailure.ViewFailed">
+            <summary>
+            The browser view for this overlay could not be created or brought
+            into a usable, secure state.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayFailure.CompositionUnavailable">
+            <summary>
+            Transparency was requested and cannot be delivered here - an
+            interactive HUD without composition support (Windows 8+ and a 2021+
+            runtime), or a transparent background the runtime refused. A
+            non-transparent overlay would still work.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayFailure.RendererCrashed">
+            <summary>
+            The browser or its renderer process died (the renderer only after
+            bounded reload attempts). Creating the overlay again may well work.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayFailure.VirtualHostFailed">
+            <summary>
+            A folder in <see cref="P:WebOverlay.OverlayOptions.VirtualHosts"/> could not be
+            served - a missing folder, a malformed host name, or a runtime too
+            old to map folders at all. The overlay refuses to continue rather
+            than let the page's own host name reach the network.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.EventDispatch">
+            <summary>
+            Which thread an overlay's events arrive on.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.EventDispatch.OverlayThread">
+            <summary>
+            The library's own thread, as events have always arrived. Queue what
+            a handler learns and touch game state from your own `Update`.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.EventDispatch.MainThread">
+            <summary>
+            The game's main thread, delivered from the library plugin's
+            `Update`, so a handler may touch Unity objects directly. Costs up
+            to one frame - and note whose frame: the work happens inside the
+            library's `Update`, so a profiler bills it there and its place in
+            the frame follows plugin load order.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.EventDispatch.Manual">
+            <summary>
+            The game's main thread, but on your terms: events wait until you
+            call <see cref="M:WebOverlay.IWebOverlay.PumpEvents"/>, so they run inside your
+            own `Update`, at the point you choose, on your own frame budget.
+            An overlay set to this and never pumped receives nothing - the
+            queue fills and then drops, with one warning.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.PostOptions">
+            <summary>
+            How a channel message should be treated beyond sending it once.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.PostOptions.None">
+            <summary>Sent once, to whoever is listening now.</summary>
+        </member>
+        <member name="F:WebOverlay.PostOptions.Retain">
+            <summary>
+            Remembered as the current value of this channel and re-sent to
+            every page that loads afterwards, before anything else reaches it.
+            The library reloads a page by itself after a renderer crash, and a
+            fresh document starts from its own defaults - so configuration a
+            mod sent once would quietly be lost mid-session. Only the newest
+            retained payload per channel is kept, and retargeting the overlay
+            with <see cref="M:WebOverlay.IWebOverlay.LoadHtml(System.String)"/> or
+            <see cref="M:WebOverlay.IWebOverlay.Navigate(System.String)"/> forgets them all: the page
+            changed, so its state is not the new page's state.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.PostOptions.LatestOnly">
+             <summary>
+             Worth sending only while it is the newest: if the page has not
+             received the previous payload on this channel yet, that one is
+             dropped and this takes its place. For per-frame telemetry - marker
+             positions, a camera feed - where an older frame has no value once a
+             newer one exists.
+            
+             This applies while the library still holds the message. Once it has
+             handed a message to the browser there is no queue here to collapse,
+             so a page that consumes slower than the mod sends should also ask
+             for `{ latest: true }` on its side of the channel.
+             </summary>
+        </member>
+        <member name="T:WebOverlay.OverlayTransparency">
+            <summary>
+            How an overlay ended up doing transparency, which decides how a page
+            should be styled: composition gives true per-pixel alpha, the chroma
+            key does not. Available once <see cref="E:WebOverlay.IWebOverlay.Ready"/> has fired;
+            the page learns the same thing without any mod code from the class the
+            library puts on its root element.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayTransparency.None">
+            <summary>An ordinary opaque window.</summary>
+        </member>
+        <member name="F:WebOverlay.OverlayTransparency.Composition">
+            <summary>
+            True per-pixel alpha: `rgba()` glass, soft shadows and clean
+            antialiasing blend with the game. Page class `wo-composed`.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayTransparency.ChromaKey">
+            <summary>
+            The fallback on older systems: transparency is binary and
+            semi-transparent pixels blend towards near-black, so a page wants
+            solid panels here. Page class `wo-chroma`.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.OverlayRegion">
+            <summary>
+            A rectangle in the overlay's own pixels, measured from its top-left
+            corner. Used by <see cref="M:WebOverlay.IWebOverlay.SetShape(WebOverlay.OverlayRegion[])"/>.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.VirtualHost">
+            <summary>
+            Maps `https://&lt;Host&gt;/` to a local folder, so a page can load real
+            files - scripts, fonts, images - instead of being one inlined string.
+            See <see cref="P:WebOverlay.OverlayOptions.VirtualHosts"/>.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.VirtualHost.Host">
+            <summary>
+            The host name alone, without scheme or slashes - for example
+            "yourmod.assets". Pick something unique to your mod: it is also the
+            origin the page's `localStorage` belongs to.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.VirtualHost.Folder">
+            <summary>Absolute path to the folder served under that host.</summary>
+        </member>
+        <member name="P:WebOverlay.VirtualHost.Access">
+             <summary>
+             How much of this folder other origins in the same overlay may read.
+             The default is what every mapping has always had.
+             </summary>
+             <remarks>
+             This is a property of the host being READ, not of a pair of hosts:
+             it belongs on the host the assets come from. A page on host A that
+             wants web fonts from host B has to loosen B.
+            
+             An inline <c>LoadHtml</c> page has an opaque origin and is
+             therefore cross-origin to EVERY mapped host, including its only
+             one - so a single host is not protection from this.
+             </remarks>
+        </member>
+        <member name="T:WebOverlay.HostAccess">
+             <summary>
+             What other origins may read from a virtual host. The names follow
+             WebView2's own COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND, whose table is:
+            
+             <list type="bullet">
+             <item><description><c>Deny</c> - nothing cross-origin at all, not even an
+             <c>img</c> or <c>script</c> source.</description></item>
+             <item><description><c>DenyCors</c> - ordinary sub-resource loads pass;
+             anything CORS-checked (fetch, XHR, and web fonts, which are fetched in
+             CORS mode by specification) is refused.</description></item>
+             <item><description><c>Allow</c> - everything, CORS-checked included.
+             </description></item>
+             </list>
+             </summary>
+        </member>
+        <member name="F:WebOverlay.HostAccess.DenyCors">
+            <summary>The default, and what every mapping had before this existed.</summary>
+        </member>
+        <member name="F:WebOverlay.HostAccess.Deny">
+            <summary>Nothing cross-origin. Strictest, and it can break a page's own assets.</summary>
+        </member>
+        <member name="F:WebOverlay.HostAccess.Allow">
+            <summary>
+            Everything, CORS-checked included. Say this when a page on one of
+            your hosts needs web fonts or fetch from another of them.
+            </summary>
+            <remarks>
+            It is not free: this is the equivalent of the folder answering
+            "Access-Control-Allow-Origin: *", to every origin in the overlay -
+            including any remote origin the mod put in
+            <see cref="P:WebOverlay.OverlayOptions.AllowedOrigins"/>. Map a folder that holds
+            only what the page may read, not a whole plugin directory.
+            </remarks>
+        </member>
+        <member name="T:WebOverlay.OverlayOptions">
+             <summary>
+             How an overlay window should look and behave.
+            
+             For a WINDOW the player uses in a raid: set <see cref="P:WebOverlay.OverlayOptions.Width"/> and
+             <see cref="P:WebOverlay.OverlayOptions.Height"/> (never leave both 0 - the default is 80% of the
+             picture, centred, exactly where the game reads the mouse while the
+             player turns), set <see cref="P:WebOverlay.OverlayOptions.FreeCursorWhileShown"/>, and consider
+             <see cref="P:WebOverlay.OverlayOptions.ClickThroughWhenUnfocused"/>. If your handlers touch Unity
+             objects, set <see cref="P:WebOverlay.OverlayOptions.DispatchOnMainThread"/>. For a HUD: set
+             <see cref="P:WebOverlay.OverlayOptions.Transparent"/> and none of the cursor options. The
+             repository's examples/ folder holds both shapes, compiled verbatim on
+             every release.
+             </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.Width">
+            <summary>Width in pixels; 0 means 80% of the game's window.</summary>
+            <remarks>
+            Leaving both at 0 puts the window over the middle of the picture,
+            and in a first-person game that is the exact point the mouse is
+            read from while the player turns - Windows delivers the movement to
+            whatever window is under the pointer, whoever has the foreground.
+            A panel there stops the player turning, with nothing anywhere
+            reporting an error, because nothing is in error. See
+            <see cref="P:WebOverlay.OverlayOptions.ClickThroughWhenUnfocused"/>, or simply give the window
+            a size and a place of its own.
+            </remarks>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.Height">
+            <summary>Height in pixels; 0 means 85% of the game's window.</summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.Frame">
+            <summary>
+            Draw a title bar with a close button. On by default, and worth
+            keeping: while the overlay holds the keyboard the game cannot see a
+            toggle key, so without a frame the close keys are the only way out.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.CloseKeys">
+            <summary>Virtual key codes that close the overlay. Escape by default.</summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.ContextMenu">
+            <summary>Allow the browser's right-click menu. Off by default.</summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.DevTools">
+            <summary>Allow F12 developer tools. Useful while building a page.</summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.Opacity">
+            <summary>
+            Overall window opacity from 0.15 to 1.0; values outside are clamped.
+            The whole window - content included - fades evenly. The overlay stays
+            interactive, so this suits panels that should not fully cover the game.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.Transparent">
+             <summary>
+             HUD mode. Pixels the page leaves unpainted show the game; painted
+             content floats over it. Without <see cref="P:WebOverlay.OverlayOptions.Interactive"/> the
+             window ignores the mouse and never takes focus, so the game stays
+             fully playable - which also means <see cref="P:WebOverlay.OverlayOptions.CloseKeys"/> cannot
+             apply: hide the HUD from the mod's own hotkey via
+             <see cref="M:WebOverlay.IWebOverlay.Hide"/> or Toggle. Unless a size is set, the
+             HUD covers the game's whole client area, and <see cref="P:WebOverlay.OverlayOptions.Frame"/>
+             is ignored (<see cref="P:WebOverlay.OverlayOptions.Opacity"/> too when composition hosted -
+             fade in the page's CSS instead; the chroma-key fallback still
+             applies it). A sized HUD sits at the game
+             picture's top-left corner - prefer the full-size default and place
+             elements with CSS.
+            
+             On Windows 8+ with a 2021+ WebView2 runtime the HUD is composition
+             hosted: transparency is TRUE per-pixel alpha - rgba() glass, soft
+             shadows and clean antialiasing all blend with the game. On older
+             systems it falls back to a chroma key, where transparency is
+             binary, semi-transparent pixels blend towards near-black, and
+             rgb(3,1,3) is reserved - design for solid-ish panels if those
+             systems matter to you.
+             </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.AllowedOrigins">
+            <summary>
+            Extra origins ("https://example.com") the overlay may navigate to
+            and receive messages from. The origin of every URL passed to
+            <see cref="M:WebOverlay.IWebOverlay.Navigate(System.String)"/> is trusted automatically; all
+            other navigation - redirects, followed links - is blocked, so a
+            foreign page never reaches the message bridge.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.RememberBounds">
+            <summary>
+            Remember the window's position and size across sessions (stored in
+            `%LOCALAPPDATA%\WebOverlay\window-bounds.txt`) and keep them while
+            toggling. On by default. HUDs never persist - they follow the game
+            window. A remembered spot that is no longer on any screen falls
+            back to the centered default.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.Interactive">
+            <summary>
+            Makes a <see cref="P:WebOverlay.OverlayOptions.Transparent"/> HUD receive mouse input: HTML
+            buttons, hovers and wheel scrolling work, forwarded to the page
+            while the game keeps the keyboard. Requires composition support
+            (Windows 8+ with a 2021+ WebView2 runtime) - creation fails
+            otherwise, reported through <see cref="E:WebOverlay.IWebOverlay.Failed"/>.
+            The window then swallows mouse input over its WHOLE rectangle, so
+            size such an overlay to its content instead of the full screen.
+            Keyboard input is not forwarded (yet); <see cref="P:WebOverlay.OverlayOptions.CloseKeys"/> do
+            not apply. Ignored without <see cref="P:WebOverlay.OverlayOptions.Transparent"/>.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.PersistenceKey">
+            <summary>
+            The key the bounds are stored under; defaults to
+            "&lt;calling assembly&gt;/&lt;title&gt;". Set it when the title changes
+            between sessions, or when several overlays share a title but
+            should remember separate spots.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.DispatchOnMainThread">
+             <summary>
+             Raise this overlay's events on the game's main thread instead of the
+             overlay thread, so a handler may touch Unity objects directly and
+             the usual queue-and-drain boilerplate disappears. Off by default.
+            
+             Events are queued and delivered from the library plugin's own
+             Update, so they arrive up to one frame later and, after
+             <c>Dispose()</c>, not at all. Outside the game -
+             no plugin, no Update - there is nothing to dispatch to, so the
+             overlay keeps its normal threading and says so once in the log.
+             </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.Dispatch">
+            <summary>
+            Which thread this overlay's events arrive on, and who pays for
+            them. <see cref="P:WebOverlay.OverlayOptions.DispatchOnMainThread"/> is the older way of saying
+            <see cref="F:WebOverlay.EventDispatch.MainThread"/> and still works; setting
+            either is enough.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.InjectTheme">
+            <summary>
+            Puts the library's palette on the page as CSS custom properties -
+            `--wo-gold`, `--wo-ink`, `--wo-text`, `--wo-dim`, `--wo-accent`,
+            `--wo-font`, `--wo-border`, `--wo-radius` - so overlays from
+            different mods can look like one family without copying hex values
+            around. Off by default: a mod with its own look should not have to
+            fight a theme it did not ask for. See `docs/STYLE.md`.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.FreeCursorWhileShown">
+             <summary>
+             While this overlay is visible and the game window does not have the
+             focus, hand the mouse cursor back to the player. A game that
+             captures the cursor keeps it captured when a window of the same
+             process takes the foreground, so a framed overlay opened mid-raid
+             would otherwise be unreachable - this is the library undoing its own
+             side effect. The moment the game has the focus again the library
+             stops touching the cursor and the game takes it back.
+            
+             Needs the library's Unity plugin, so it does nothing in a non-Unity
+             host. Off by default, and pointless for a HUD, which never takes
+             the foreground.
+             </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.ClickThroughWhenUnfocused">
+             <summary>
+             While the game is the window in front, let the mouse pass through
+             this overlay to the game instead of landing on it.
+            
+             For a panel that covers the middle of the screen this is the
+             difference between a playable game and a frozen one. The game locks
+             the cursor to the centre of its own window, and Windows delivers
+             mouse movement to whatever window sits under the pointer - so a
+             panel over that point receives the movement and the player cannot
+             turn, with nothing reporting an error: the cursor state is right and
+             the game has the foreground.
+            
+             The cost is that the panel can no longer be clicked to bring it back
+             to the front, because a click is mouse input like any other. Its
+             hotkey still works, which is how it was opened. Off by default for
+             that reason, and pointless for a HUD, which never takes the
+             foreground in the first place.
+             </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.AllowDownloads">
+            <summary>
+            Let pages start downloads. Off by default, and deliberately so: a
+            page over a game has no business writing files to the player's
+            disk, a download bar over the game is never wanted, and every page
+            here is the mod's own - a mod that wants the bytes of something
+            serves it from a virtual host or fetches it itself. Blocked
+            attempts are logged with the URL, once each. On a runtime too old
+            to expose download control (before 2021) downloads keep the
+            browser's default behaviour, and the log says so. Arrived in
+            1.10.0, tightening what earlier versions left browser-managed.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.OverlayOptions.VirtualHosts">
+             <summary>
+             Folders served to the page as `https://&lt;host&gt;/`, so it can load
+             real files instead of inlining everything. The mapped origins are
+             trusted automatically, exactly like a
+             <see cref="M:WebOverlay.IWebOverlay.Navigate(System.String)"/> target.
+            
+             A page that navigates to its own mapped host (rather than being
+             pushed in through <see cref="M:WebOverlay.IWebOverlay.LoadHtml(System.String)"/>) gains what an
+             inline page cannot have: same-origin assets - fonts included -
+             working `localStorage` isolated per host name, no 2 MB document
+             limit, and real file paths in the developer tools.
+            
+             The folder is served read-only, and the mapping exists only inside
+             this overlay's own browser view - so nothing outside it can reach
+             the files. Inside it, `fetch` and XHR from another origin are
+             denied, but another origin you allow in the same overlay can still
+             load files as a script, image or iframe. Map a folder that holds
+             only what your interface serves.
+             </summary>
+        </member>
+        <member name="T:WebOverlay.VisibilityOutcome">
+            <summary>
+            How a <see cref="M:WebOverlay.IWebOverlay.Show(System.Action{WebOverlay.VisibilityOutcome})"/> or
+            <see cref="M:WebOverlay.IWebOverlay.Hide(System.Action{WebOverlay.VisibilityOutcome})"/> request
+            ended. Answered exactly once per request - or, only once the game is
+            shutting down, not at all. Arrived in 1.11.0.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.VisibilityOutcome.Applied">
+            <summary>
+            The overlay is now in the requested state and was not before. The
+            matching <see cref="E:WebOverlay.IWebOverlay.VisibilityChanged"/> was raised no
+            later than this answer was queued; under
+            <see cref="F:WebOverlay.EventDispatch.Manual"/> a
+            <see cref="M:WebOverlay.IWebOverlay.PumpEvents"/> call that finds both waiting
+            delivers the answer first - and one may find only the event.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.VisibilityOutcome.AlreadyThere">
+            <summary>
+            The overlay already was in the requested state. Nothing changed
+            and no <see cref="E:WebOverlay.IWebOverlay.VisibilityChanged"/> was raised.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.VisibilityOutcome.RefusedFullscreen">
+            <summary>
+            A Show refused because the game is in exclusive fullscreen, where
+            a window over it would minimise it. The overlay stays alive and
+            hidden - the player can switch modes - so this is neither a
+            visibility change nor a failure.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.VisibilityOutcome.Superseded">
+            <summary>
+            A newer Show, Hide or Toggle on this overlay replaced the request
+            before it was applied; the newer request reports the result. Only
+            possible while the browser view is still being built, which is
+            where a request waits.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.VisibilityOutcome.Failed">
+            <summary>
+            The overlay had failed before the request could be applied - for a
+            Hide as much as for a Show, since a dead window is not "there".
+            </summary>
+        </member>
+        <member name="F:WebOverlay.VisibilityOutcome.Disposed">
+            <summary>
+            The handle was disposed before, or while, the request was being
+            applied. A disposed handle stops dispatching events, so whatever
+            the request did is not reported to it - under
+            <see cref="F:WebOverlay.EventDispatch.OverlayThread"/> an event already in
+            flight can still arrive inline before this answer - and this
+            outcome wins over every other.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.VisibilityOutcome.QueueRefused">
+            <summary>
+            The library's command queue refused the request: this overlay had
+            its share of commands waiting already, or the whole queue was at
+            its ceiling. Nothing was queued and nothing will happen. Retry
+            later; never fall back on it.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.IWebOverlay">
+            <summary>A single overlay window.</summary>
+        </member>
+        <member name="P:WebOverlay.IWebOverlay.IsPageLoaded">
+            <summary>
+            Whether the page the mod last targeted has finished loading. Sends
+            before that are buffered rather than lost, so this is for a
+            consumer that streams: hold off while it is false instead of
+            filling the outbox. Pairs with <see cref="E:WebOverlay.IWebOverlay.PageLoaded"/>.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.IWebOverlay.Transparency">
+            <summary>
+            Which kind of transparency this overlay actually got. Meaningful
+            once <see cref="E:WebOverlay.IWebOverlay.Ready"/> has fired; the page can read the same fact
+            from the `wo-composed` / `wo-chroma` class on its root element.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.IWebOverlay.Failure">
+            <summary>
+            Why <see cref="E:WebOverlay.IWebOverlay.Failed"/> fired; <see cref="F:WebOverlay.OverlayFailure.Unknown"/>
+            while the overlay is healthy. Read it in the handler to tell the
+            user what to do about it.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.IWebOverlay.FailureMessage">
+            <summary>
+            The exact reason behind <see cref="P:WebOverlay.IWebOverlay.Failure"/>, as one log-ready
+            sentence; null while the overlay is healthy.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.Show(System.Action{WebOverlay.VisibilityOutcome})">
+             <summary>
+             <see cref="M:WebOverlay.IWebOverlay.Show"/> that says how it ended, through
+             <paramref name="completed"/>, exactly once - or, only once the game
+             is shutting down, not at all. The answer travels like an
+             <see cref="M:WebOverlay.IWebOverlay.ExecuteScript(System.String,System.Action{System.String})"/> result: the
+             overlay thread, the game's main thread, or your next
+             <see cref="M:WebOverlay.IWebOverlay.PumpEvents"/>, and it is still delivered after
+             <see cref="M:System.IDisposable.Dispose"/>. It may run synchronously inside
+             this call when the request is refused at once, and after a
+             dispose it may arrive on the overlay thread whatever the dispatch
+             mode. Keep pumping a manual overlay while an answer is
+             outstanding, and never wait for one in <c>OnDestroy</c>.
+            
+             A request that arrives before the browser view exists - every
+             consumer's first does, whether it runs before the creation or
+             while the creation is waiting for the view - waits for the view
+             and is answered before <see cref="E:WebOverlay.IWebOverlay.Ready"/>.
+             <see cref="F:WebOverlay.VisibilityOutcome.Applied"/> means the native window,
+             not the page: it precedes <see cref="E:WebOverlay.IWebOverlay.PageLoaded"/>. There is no
+             order promise between the answer and the
+             <see cref="E:WebOverlay.IWebOverlay.VisibilityChanged"/> it caused: use the answer for the
+             request you made and the event for transitions you did not ask
+             for. Arrived in 1.11.0.
+             </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.Hide(System.Action{WebOverlay.VisibilityOutcome})">
+            <summary>
+            <see cref="M:WebOverlay.IWebOverlay.Hide"/> that says how it ended; everything said for
+            <see cref="M:WebOverlay.IWebOverlay.Show(System.Action{WebOverlay.VisibilityOutcome})"/> applies. A window
+            whose browser view does not exist yet is already hidden and is
+            answered <see cref="F:WebOverlay.VisibilityOutcome.AlreadyThere"/> at once.
+            Arrived in 1.11.0.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.Navigate(System.String)">
+            <summary>Loads a URL, for a mod that already serves pages.</summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.LoadHtml(System.String)">
+            <summary>Shows markup directly, so no web server is needed.</summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.Post(System.String)">
+            <summary>
+            Sends a string to the page, where it arrives as a `message` event on
+            `window.chrome.webview`.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.Post(System.String,System.String)">
+            <summary>
+            Sends a string on a named channel, where it arrives at every
+            `window.overlay.on(channel, ...)` handler in the page. Saves both
+            sides the prefix-and-split every consumer wrote for itself.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.Post(System.String,System.String,WebOverlay.PostOptions)">
+            <summary>
+            The same, with <see cref="T:WebOverlay.PostOptions"/> - a value the page should
+            get again after it reloads, or one that is only worth sending while
+            it is the newest.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.TryPost(System.String)">
+             <summary>
+             <see cref="M:WebOverlay.IWebOverlay.Post(System.String)"/> that says whether the command entered
+             the library's command queue. False means it did not and will not:
+             the handle was disposed, or the queue refused it - this overlay
+             had its share of commands waiting already, or the whole queue was
+             at its ceiling. Retry later; never fall back on it. During
+             shutdown the library accepts everything and does nothing, like
+             every other call, so the answer is true then.
+            
+             True is not delivery. A queued message can still be lost to the
+             outbox limit before the page loads (plain sends; a
+             <see cref="F:WebOverlay.PostOptions.Retain"/>ed one is kept), to a document
+             that is not the mod's target, to a retarget - <see cref="M:WebOverlay.IWebOverlay.LoadHtml(System.String)"/>
+             and <see cref="M:WebOverlay.IWebOverlay.Navigate(System.String)"/> forget both the outbox and the retained
+             set - to a renderer crash without <see cref="F:WebOverlay.PostOptions.Retain"/>,
+             to a failure or close that lands first, and to the browser itself,
+             which does not report whether it took the string. What
+             <see cref="F:WebOverlay.PostOptions.Retain"/> buys is that a true survives
+             reloads. A page that must acknowledge still does so through
+             <see cref="M:WebOverlay.IWebOverlay.Request(System.String,System.String,System.Action{System.String})"/> or
+             <see cref="M:WebOverlay.IWebOverlay.ExecuteScript(System.String,System.Action{System.String})"/>, both of which
+             answer null when refused. Arrived in 1.11.0.
+             </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.TryPost(System.String,System.String)">
+            <summary>
+            <see cref="M:WebOverlay.IWebOverlay.Post(System.String,System.String)"/> that says whether the command
+            entered the library's command queue; see
+            <see cref="M:WebOverlay.IWebOverlay.TryPost(System.String)"/> for what the answer means. Arrived in
+            1.11.0.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.TryPost(System.String,System.String,WebOverlay.PostOptions)">
+            <summary>
+            <see cref="M:WebOverlay.IWebOverlay.Post(System.String,System.String,WebOverlay.PostOptions)"/> that says whether
+            the command entered the library's command queue; see
+            <see cref="M:WebOverlay.IWebOverlay.TryPost(System.String)"/> for what the answer means. Arrived in
+            1.11.0.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.Request(System.String,System.String,System.Action{System.String})">
+            <summary>
+            Asks the page a question and takes its answer, from the page's
+            `window.overlay.onRequest(channel, ...)` handler - which may return
+            a value or a promise. Answered exactly once: with the page's reply,
+            or with null if no answer arrives within five seconds, so a page
+            that cannot answer never hangs the mod. The answer arrives where
+            the events do - see
+            <see cref="M:WebOverlay.IWebOverlay.ExecuteScript(System.String,System.Action{System.String})"/> for what each
+            <see cref="T:WebOverlay.EventDispatch"/> mode means for one.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.Request(System.String,System.String,System.Action{System.String},System.Int32)">
+            <summary>
+            Asks the page a question with an explicit deadline in
+            milliseconds; see <see cref="M:WebOverlay.IWebOverlay.Request(System.String,System.String,System.Action{System.String})"/>.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.OnRequest(System.String,System.Func{System.String,System.String})">
+            <summary>
+            Answers questions the page asks with `window.overlay.request(channel, ...)`.
+            One handler per channel; a null handler removes it, and a channel
+            without one is answered with null rather than left open. The
+            handler runs where the events run - the overlay thread, or the
+            game's main thread with
+            <see cref="P:WebOverlay.OverlayOptions.DispatchOnMainThread"/>.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.OnRequest(System.String,System.Action{System.String,System.Action{System.String}})">
+            <summary>
+            The same, for an answer that is not ready yet: call `reply` once,
+            whenever and from wherever the answer arrives - after a scan, a
+            file write, a round trip of your own. A handler that throws before
+            replying answers null, and a reply that arrives after the page gave
+            up waiting is dropped rather than resolving a stale promise, so the
+            page can raise its own deadline with
+            `overlay.request(channel, payload, timeoutMs)` when it expects to
+            wait.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.ExecuteScript(System.String)">
+            <summary>Runs JavaScript in the page, for pushing live values.</summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.ExecuteScript(System.String,System.Action{System.String})">
+             <summary>
+             Runs JavaScript and hands back what it evaluated to, as the JSON the
+             browser produced ("42", "\"text\"", "null" for no value). The
+             callback is answered exactly once - with null when the script could
+             not run at all: no page, a page that is no longer the mod's target,
+             a renderer that crashed under it, an overlay that closed, or a
+             script the browser rejected. So a caller waiting for a value is
+             never left waiting forever - the answer arrives even after the
+             handle was disposed. The one exception is the game shutting down,
+             where the library delivers nothing at all rather than wake a
+             fallback on the way out.
+            
+             Threading follows the events: the overlay thread, the game's main
+             thread with <see cref="F:WebOverlay.EventDispatch.MainThread"/>, or your own
+             <see cref="M:WebOverlay.IWebOverlay.PumpEvents"/> call with
+             <see cref="F:WebOverlay.EventDispatch.Manual"/> - where the answer waits for the
+             pump like everything else, so keep pumping while you are waiting
+             for one. Disposing the handle is the exception even there: nobody
+             pumps a handle they have thrown away, so the answers owed at that
+             point are delivered on the spot instead.
+             </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.OpenDevTools">
+            <summary>Opens the browser developer tools, if enabled in the options.</summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.PumpEvents">
+            <summary>
+            Delivers this overlay's waiting events, on the calling thread. Only
+            for <see cref="F:WebOverlay.EventDispatch.Manual"/>, where it is the one thing
+            that makes events arrive at all; call it from your own `Update`.
+            Harmless in the other modes, where it has nothing to deliver.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.SetBounds(System.Nullable{System.Int32},System.Nullable{System.Int32},System.Nullable{System.Int32},System.Nullable{System.Int32})">
+            <summary>
+            Moves or resizes the overlay, in screen coordinates. Any argument
+            left null keeps its current value. A window positioned this way is not written to the
+            remembered-bounds store - that belongs to the player - but it does
+            win over a remembered spot for the rest of the session.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.IWebOverlay.SetShape(WebOverlay.OverlayRegion[])">
+             <summary>
+             Cuts the overlay down to these rectangles: it draws there and takes
+             the mouse there, and everything outside belongs to the game. Null
+             (the default) means the whole window. Rectangles are measured from
+             the top-left of the page, so a framed overlay keeps its title bar
+             whatever shape is set.
+            
+             This is how an <see cref="P:WebOverlay.OverlayOptions.Interactive"/> HUD can
+             cover the screen and still leave the game playable: give it the
+             rectangles it actually draws in. Both halves - picture and mouse -
+             come from the one mechanism Windows offers for this, so they cannot
+             be separated: whatever is cut away is cut away for both. Pad the
+             rectangles a little if your content has soft shadows.
+            
+             The page usually knows its own layout better than the mod does and
+             can say so directly with `overlay.setShape([element, ...])`, which
+             accepts elements or `{x, y, w, h}` objects, converts them to device
+             pixels, and should be called again when the layout changes.
+             </summary>
+        </member>
+        <member name="E:WebOverlay.IWebOverlay.MessageReceived">
+            <summary>
+            Raised when the page calls `window.chrome.webview.postMessage(...)`.
+            Runs on the overlay thread: hop to Unity's thread before touching
+            game state. Channel traffic does not appear here - it has its own
+            event - but anything else the page sends arrives verbatim.
+            </summary>
+        </member>
+        <member name="E:WebOverlay.IWebOverlay.ChannelMessage">
+            <summary>
+            Raised when the page calls `window.overlay.send(channel, payload)`.
+            Same threading as <see cref="E:WebOverlay.IWebOverlay.MessageReceived"/>.
+            </summary>
+        </member>
+        <member name="E:WebOverlay.IWebOverlay.KeyPressed">
+            <summary>Raised for keys pressed in the overlay that did not close it.</summary>
+        </member>
+        <member name="E:WebOverlay.IWebOverlay.PageLoaded">
+            <summary>
+            Raised whenever the page the mod targeted has finished loading -
+            on every navigation, so a reload after a renderer crash raises it
+            again. This is "my page is live", as opposed to <see cref="E:WebOverlay.IWebOverlay.Ready"/>,
+            which only means the browser view exists.
+            </summary>
+        </member>
+        <member name="E:WebOverlay.IWebOverlay.Closed">
+            <summary>
+            Raised whenever the overlay is hidden or closed. Note that this
+            includes the mod's own <see cref="M:WebOverlay.IWebOverlay.Hide"/>, so it cannot tell "the
+            player closed it" from "we closed it" - use
+            <see cref="E:WebOverlay.IWebOverlay.VisibilityChanged"/> for state, and expect this event to
+            narrow to real closes in a future major version.
+            </summary>
+        </member>
+        <member name="E:WebOverlay.IWebOverlay.VisibilityChanged">
+            <summary>
+            Raised when the overlay becomes visible or invisible, and only on
+            an actual change - so it can be trusted as state instead of being
+            reconciled against the consumer's own flag every frame. Fires false
+            when a failure hides the overlay, and once more when a visible
+            overlay is destroyed.
+            </summary>
+        </member>
+        <member name="E:WebOverlay.IWebOverlay.Ready">
+            <summary>
+            Raised once the browser view is fully set up. Latched: a handler
+            subscribed after the fact still runs - immediately, on the
+            subscribing thread - otherwise on the overlay thread; treat it as
+            "any thread". That immediacy belongs to
+            <see cref="F:WebOverlay.EventDispatch.OverlayThread"/> alone. Whenever the
+            overlay dispatches elsewhere, a late subscription is queued like
+            every other event rather than run inside the Add call: with
+            <see cref="F:WebOverlay.EventDispatch.MainThread"/> it arrives on the game's
+            next frame, and with <see cref="F:WebOverlay.EventDispatch.Manual"/> on your
+            next <see cref="M:WebOverlay.IWebOverlay.PumpEvents"/> - so a gate must not read its own
+            fallback flag on the frame it subscribed.
+            </summary>
+        </member>
+        <member name="E:WebOverlay.IWebOverlay.Failed">
+            <summary>
+            Raised when the overlay cannot work - browser start failed, the
+            browser process died, HUD transparency unavailable. The overlay
+            stays hidden; dispose the handle and use a fallback.
+            <see cref="P:WebOverlay.IWebOverlay.Failure"/> and <see cref="P:WebOverlay.IWebOverlay.FailureMessage"/> say why, and
+            are set before this fires. Latched exactly like
+            <see cref="E:WebOverlay.IWebOverlay.Ready"/>, including when a late subscription is answered
+            under each <see cref="T:WebOverlay.EventDispatch"/> mode.
+            </summary>
+        </member>
+        <member name="E:WebOverlay.IWebOverlay.ChannelsFailed">
+            <summary>
+            Raised when the channel shim could not be installed - and only
+            then. The overlay itself keeps working: the window renders, raw
+            <see cref="M:WebOverlay.IWebOverlay.Post(System.String)"/> / <see cref="E:WebOverlay.IWebOverlay.MessageReceived"/> and
+            <see cref="M:WebOverlay.IWebOverlay.ExecuteScript(System.String,System.Action{System.String})"/> are untouched.
+            What is dead is everything built on <c>window.overlay</c>: named
+            channels, request/reply, retained replay into the page. A consumer
+            whose page depends on those should fall back the way it would for
+            <see cref="E:WebOverlay.IWebOverlay.Failed"/>; one that only uses the raw bridge may ignore
+            this. Latched exactly like <see cref="E:WebOverlay.IWebOverlay.Failed"/>, so a late
+            subscription still hears it. Arrived in 1.10.0.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.IWebOverlay.ChannelsAvailable">
+            <summary>
+            Whether <c>window.overlay</c> is going to exist in this overlay's
+            pages: null while the answer is not in yet (the shim installs
+            during creation), then true or false for the overlay's lifetime.
+            The false transition is the moment <see cref="E:WebOverlay.IWebOverlay.ChannelsFailed"/>
+            fires. Arrived in 1.10.0.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHandle.raise(System.Action)">
+            <summary>
+            Hands one event to the consumer, on the game's main thread when the
+            overlay asked for it. A dispatched event that is still queued when
+            the handle is disposed is dropped: the consumer has already let go
+            of the overlay, and calling it afterwards is how a fallback ends up
+            running against a null field.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.OverlayHandle.manualResults">
+            <summary>
+            Delivers a script result. Unlike an event, this is a promise made to
+            one caller, so it is handed over even after the handle was disposed:
+            whoever asked for the value is still waiting for it, and dropping it
+            would break the "answered exactly once" contract that makes the API
+            safe to await. Only a game that is shutting down swallows it, like
+            every other callback.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHandle.visibilitySettler(System.Action{WebOverlay.VisibilityOutcome})">
+            <summary>
+            Wraps a visibility completion so that it settles exactly once
+            wherever the answer comes from - the call itself, the window, a
+            failure, a close - travels like a script result, stays quiet
+            during shutdown, and reports Disposed whenever the handle is
+            disposed by the time it settles, because the outcome must agree
+            with what the consumer can still observe.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.OverlayHandle.tryPost(System.Action)">
+            <summary>
+            The same droppable path as <see cref="M:WebOverlay.OverlayHandle.post(System.Action)"/>, with the host's
+            answer handed back instead of discarded. A disposed handle answers
+            false itself; the host answers true during shutdown by its own
+            rule, and that answer is passed on unchanged - two methods giving
+            opposite answers to one question would be the trap here.
+            </summary>
+        </member>
+        <member name="T:WebOverlay.WebOverlayPlugin">
+            <summary>
+            Library plugin. It hosts no interface of its own; it exists so mods can
+            depend on one shared browser instead of each carrying its own, and so
+            the game window and the overlay thread are found and shut down once.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.WebOverlayPlugin.DiagnoseCursor">
+            <summary>
+            Off by default: it is a tool for answering one specific kind of
+            report - "the mouse stopped working while a panel was open" - which
+            cannot be told from correct behaviour without knowing which window
+            the OS has in front.
+            </summary>
+        </member>
+        <member name="F:WebOverlay.WebOverlayPlugin.DiagnosePage">
+            <summary>
+            Off by default like its neighbour, and for the same reason: it
+            answers a bug report and is of no use to a player.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.WebOverlayPlugin.Update">
+            <summary>
+            Delivers the events of overlays that asked for main-thread
+            dispatch. Nothing is queued unless a mod opted in, so this is an
+            empty dequeue attempt per frame otherwise.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.WebOverlayPlugin.LateUpdate">
+            <summary>
+            Only for the fallback path, where the cursor is set directly and
+            the game keeps setting it back; asking the game for the cursor is a
+            state change and needs no second call per frame.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.WebOverlayPlugin.observe(System.Boolean)">
+             <summary>
+             Once per frame, and ahead of everything that can return early: the
+             path that returns soonest is the one where this library is holding
+             the cursor, so watching from further down could never see a working
+             overlay, only a broken one - an instrument blind to exactly the
+             state in question, whose silence reads as evidence.
+            
+             Deliberately not called from LateUpdate as well. A second look in
+             the same frame learns nothing, and it costs a window-style write
+             every time the answer flips - which, with a menu and the game
+             writing the cursor in turn, is every frame.
+             </summary>
+        </member>
+        <member name="M:WebOverlay.WebOverlayPlugin.freeCursorIfWanted(System.Boolean)">
+            <summary>
+            A game that captures the mouse keeps capturing it when another
+            window of the same process takes the foreground, which would leave
+            a framed overlay unreachable and the player stuck. While such an
+            overlay is up and the game is not focused, the cursor goes back to
+            the player; as soon as the game has the focus again the library
+            stops touching it and the game takes it back on its own.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.WebOverlayPlugin.reportCursorState(System.Boolean)">
+             <summary>
+             Says, once per change, who holds the foreground and what the cursor
+             looks like. Off unless the consumer turns it on, and it prints only
+             on a transition, so a session that behaves produces a handful of
+             lines.
+            
+             This exists because a report of "the mouse stops working while a
+             panel is open" cannot be told apart from its neighbours by reading
+             the code: the pointer being pinned to the middle of the screen is
+             what a correctly captured cursor looks like, and whether that is
+             wrong depends entirely on which window the OS thinks is in front.
+             Guessing at that from here has cost two wrong answers already.
+             </summary>
+        </member>
+        <member name="P:WebOverlay.WebOverlayPlugin.mouseMoving">
+            <summary>Movement within the last second, which is what a player would call "the mouse works".</summary>
+        </member>
+        <member name="M:WebOverlay.WebOverlayPlugin.describeWindow(System.IntPtr)">
+            <summary>Handle, class name and owner, enough to tell windows apart.</summary>
+        </member>
+        <member name="M:WebOverlay.WebOverlayPlugin.verifyCursorReturned">
+             <summary>
+             Checks, one frame after the cursor was given back, that the game
+             really took it - and repairs the one state it cannot have meant.
+            
+             The game writes the cursor only when the live state disagrees with
+             what it wants, which is what makes asking it so much better than
+             overruling it. The cost is that a state it agrees with by accident
+             is a state it never corrects. Hidden but not captured is exactly
+             that: the pointer is invisible and the mouse moves it instead of
+             turning the player, so the game looks frozen to the mouse while the
+             keyboard still works. It can be reached because the lock mode and
+             the visibility are set by different parties at different moments -
+             the game itself reapplies the lock from the CURRENT visibility when
+             the window regains focus, which is the same moment this release
+             happens.
+            
+             One write, only when that state is actually observed. Hiding always
+             means capturing, so there is exactly one right answer here.
+             </summary>
+        </member>
+        <member name="M:WebOverlay.WebOverlayPlugin.findGameWindow">
+            <summary>
+            Enumerating this thread's windows beats searching globally: the
+            thread already implies the process, the class filter drops Unity's
+            hidden helper window, and unlike the foreground window it does not
+            depend on the game being focused.
+            </summary>
+        </member>
+        <member name="P:WebOverlay.WebOverlayPlugin.IsDisplayModeSupported">
+            <summary>
+            A window over the game cannot work in exclusive fullscreen: showing
+            it would minimise the game. <see cref="M:WebOverlay.IWebOverlay.Show"/> refuses
+            it by itself; this is for a mod that wants to explain the situation
+            in its own interface. Safe to call from any thread - it reports
+            what the main thread last saw.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.WebOverlayPlugin.VirtualKey(UnityEngine.KeyCode)">
+            <summary>
+            The Win32 virtual-key code for a Unity key, or 0 when there is
+            none. <see cref="P:WebOverlay.OverlayOptions.CloseKeys"/> speaks virtual keys
+            while a configurable hotkey speaks <see cref="T:UnityEngine.KeyCode"/>, and every
+            consumer was writing this table again - the second copy only
+            because a review caught a close key hard-coded while the toggle key
+            was rebindable.
+            </summary>
+        </member>
+        <member name="M:WebOverlay.WebOverlayPlugin.CloseKeysFor(BepInEx.Configuration.KeyboardShortcut)">
+            <summary>
+            Close keys for a configurable hotkey: Escape, which players expect,
+            plus the key that opened the overlay, so the same press closes it
+            again. Keys without a virtual-key code are left out.
+            </summary>
+        </member>
+    </members>
+</doc>
